@@ -22,12 +22,19 @@ class WeReadClient:
             {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
         )
 
-    def call(self, api_name: str, **params: Any) -> dict[str, Any]:
+    def call(
+        self,
+        api_name: str,
+        *,
+        timeout: int = 45,
+        retries: int = 3,
+        **params: Any,
+    ) -> dict[str, Any]:
         payload = {"api_name": api_name, "skill_version": self.skill_version, **params}
         last_error = None
-        for attempt in range(3):
+        for attempt in range(retries):
             try:
-                response = self.session.post(GATEWAY_URL, json=payload, timeout=45)
+                response = self.session.post(GATEWAY_URL, json=payload, timeout=timeout)
                 response.raise_for_status()
                 data = response.json()
                 if data.get("upgrade_info"):
@@ -44,7 +51,7 @@ class WeReadClient:
                 raise
             except Exception as exc:  # requests and transient JSON failures
                 last_error = exc
-                if attempt < 2:
+                if attempt < retries - 1:
                     time.sleep(2**attempt)
         raise WeReadError(f"{api_name} 请求失败：{last_error}")
 
@@ -72,25 +79,45 @@ class WeReadClient:
         return rows, totals
 
     def book_bundle(self, book_id: str) -> dict[str, Any]:
-        info = self.call("/book/info", bookId=book_id)
-        progress = self.call("/book/getprogress", bookId=book_id).get("book") or {}
-        chapter_data = self.call("/book/chapterinfo", bookId=book_id)
-        bookmark_data = self.call("/book/bookmarklist", bookId=book_id)
+        def safe_call(api_name: str, **params: Any) -> dict[str, Any]:
+            try:
+                # Book-level endpoints should fail fast so one problematic title
+                # cannot block the entire scheduled sync for many minutes.
+                return self.call(
+                    api_name,
+                    timeout=12,
+                    retries=2,
+                    **params,
+                )
+            except WeReadError as exc:
+                print(f"⚠️ 跳过书籍 {book_id} 的接口 {api_name}: {exc}")
+                return {}
+
+        info = safe_call("/book/info", bookId=book_id)
+        progress = safe_call("/book/getprogress", bookId=book_id).get("book") or {}
+        chapter_data = safe_call("/book/chapterinfo", bookId=book_id)
+        bookmark_data = safe_call("/book/bookmarklist", bookId=book_id)
         reviews: list[dict[str, Any]] = []
         synckey = 0
-        while True:
-            page = self.call(
+        review_pages = 0
+        while review_pages < 20:
+            page = safe_call(
                 "/review/list/mine", bookid=book_id, synckey=synckey, count=100
             )
+            if not page:
+                break
             reviews.extend(
                 (item.get("review") or item) for item in (page.get("reviews") or [])
             )
+            review_pages += 1
             if not page.get("hasMore"):
                 break
             next_key = page.get("synckey")
             if next_key == synckey:
                 break
             synckey = next_key
+        if review_pages >= 20 and page.get("hasMore"):
+            print(f"⚠️ 书籍 {book_id} 的笔记分页超过 20 页，已停止继续读取")
         return {
             "info": info,
             "progress": progress,
